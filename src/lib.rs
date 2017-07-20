@@ -1,40 +1,43 @@
-// rust-bcm-2709-spi
-//
-// Low-performance SPI interface to BCM2709 hardware peripherals via mmap(...) and direct memory I/O.
-//
+//! rust-bcm-2709-spi
+//!
+//! Low-performance SPI interface to BCM2709 hardware peripherals via mmap(...) and direct memory I/O.
+//! 
+//! For use when you don't/can't load a specific driver on Raspberry Pi.  It is probably better
+//! to use SPIDev kernel module. But this may help for some testing in a pinch.
+//! 
+//! Usage
+//! -----
+//! ```
+//! extern crate bcm2709_spi;
+//! use bcm2709_spi::{gpio, spi, DirectMemory};
+//! 
+//! pub fn main() {
+//!   let mem = match DirectMemory::get() {
+//!     Err(x) => { println!("Failed: {}", x); return; },
+//!     Ok(x) => x
+//!   }
+//!   
+//!   let spi = match mem.spi() {
+//!     Err(x) => { println!("Couldn't create SPI: {}", x); return; },
+//!     Ok(x)  => x
+//!   }
+//!   
+//!   spi.set_clock( 32 );   // Recommend above 4; loopback misses bits at clk=4.
+//!   
+//!   spi.start_transaction();
+//!   let byte_read = spi.write_byte( b'A' );   // =65u8 when a loopback wire placed between MISO and MOSI
+//!   spi.stop_transaction();
+//! }
+//!
 
 extern crate libc;
 extern crate vcell;
 
 
-/// A peripheral
-#[derive(Debug)]
-pub struct Peripheral<T>
-where
-    T: 'static,
-{
-    address: *mut T,
-}
 
-impl<T> Peripheral<T> {
-    /// Creates a new peripheral
-    ///
-    /// `address` is the base address of the register block
-    pub unsafe fn new(address: usize) -> Self {
-        Peripheral { address: address as *mut T }
-    }
-
-    pub fn borrow<'a>(&self) -> &'a mut T {
-        unsafe { &mut *self.get() }
-    }
-
-    /// Returns a pointer to the register block
-    pub fn get(&self) -> *mut T {
-        self.address as *mut T
-    }
-}
-
+/// Linux has 4KB size pages.  Offsets in `mmap()` should align to MAP_BLOCK_SIZE.
 const MAP_BLOCK_SIZE: usize = 4 * 1024;
+
 const SPI_BASE_OFFSET: usize = 0x3f20_4000;
 const GPIO_BASE_OFFSET: usize = 0x3f20_0000;
 
@@ -59,7 +62,9 @@ pub mod spi {
     #[repr(C)]
     pub struct SPI {
         cs: CS,
+        #[doc = r"FIFO buffer; read/write to this to get SPI data"]
         fifo: FIFO,
+        #[doc = r"CLK divisor; generates SPI clock from core clock. Must be a power of 2. Rounds down to lowest power of 2. 0 = divide-by 65536"]
         clk: CLK,
     }
 
@@ -497,22 +502,24 @@ pub mod spi {
 }
 
 
+#[doc = r"Interface for getting structs to map to /dev/mem blocks"]
 pub struct DirectMemory {
     fd: i32,
 }
 
-// 
-// Lifetimes and mmap(...) access:
-// -------------------------------
-//
-// On file descriptor close, memory is not unmapped.  From POSIX, the memory mapped from a file
-// can continue to be used until it is unmapped, even if the file is closed before the unmap.
-//
-// This means that the GPIO and SPI (mmapped access) to _/dev/mem_ can remain active and call
-// **munmap(...)** when Dropped, which will fully close out the resource.
-//
-//
+/// 
+/// Lifetimes and mmap(...) access:
+/// -------------------------------
+///
+/// On file descriptor close, memory is not unmapped.  From POSIX, the memory mapped from a file
+/// can continue to be used until it is unmapped, even if the file is closed before the unmap.
+///
+/// This means that the GPIO and SPI (mmapped access) to _/dev/mem_ can remain active and call
+/// **munmap(...)** when Dropped, which will fully close out the resource.
+///
+///
 impl DirectMemory {
+    #[doc = r"Opens /dev/mem; may not succeed."]
     pub fn get() -> Result<Self, &'static str> {
         let fd;
         unsafe {
@@ -527,6 +534,7 @@ impl DirectMemory {
             } )
     }
 
+    #[doc = r"Creates the GPIO interface"]
     pub fn gpio(&mut self) -> Result<gpio::GPIOInterface, &'static str> {
         return Ok(gpio::GPIOInterface::new( self.fd ) );
     }
@@ -534,18 +542,18 @@ impl DirectMemory {
     #[doc = r"Creates the SPI interface; takes ownership via GPIO of all SPI pins: SPI_CE1, SPI_CE0, SPI_MISO, SPI_MOSI, SPI_CLK"]
     pub fn spi(&mut self) -> Result<spi::SPIInterface, &'static str> {
         let mut gpio_per = self.gpio()?;
-        let gpio_if = gpio_per.get();
-        gpio_if.fsel( 7, gpio::FSEL_0 );  // SPI_CE1
-        gpio_if.fsel( 8, gpio::FSEL_0 );  // SPI_CE0
-        gpio_if.fsel( 9, gpio::FSEL_0 );  // SPI_MISO
-        gpio_if.fsel(10, gpio::FSEL_0 );  // SPI_MOSI
-        gpio_if.fsel(11, gpio::FSEL_0 );  // SPI_CLK
+        gpio_per.fsel( 7, gpio::FSEL_0 );  // SPI_CE1
+        gpio_per.fsel( 8, gpio::FSEL_0 );  // SPI_CE0
+        gpio_per.fsel( 9, gpio::FSEL_0 );  // SPI_MISO
+        gpio_per.fsel(10, gpio::FSEL_0 );  // SPI_MOSI
+        gpio_per.fsel(11, gpio::FSEL_0 );  // SPI_CLK
 
         return Ok(spi::SPIInterface::new(self.fd));
     }
 }
 
 impl Drop for DirectMemory {
+    #[doc = r"Close the /dev/mem file descriptor on drop"]
     fn drop(&mut self) {
         if self.fd == 0 {
             return;
@@ -558,6 +566,7 @@ impl Drop for DirectMemory {
 
 
 
+#[doc = r"Simplified GPIO interface; reads/writes to direct memory. Take care not to conflict with /sys/class/gpio interface."]
 pub mod gpio {
     use vcell::VolatileCell;
     use super::{libc, MAP_BLOCK_SIZE, GPIO_BASE_OFFSET};
@@ -571,6 +580,7 @@ pub mod gpio {
     pub const FSEL_4: u8 = 0b011;
     pub const FSEL_5: u8 = 0b010;
 
+    #[doc = r"User-accessible interface to GPIO"]
     pub struct GPIOInterface {
         address: usize,
     }
@@ -595,8 +605,44 @@ pub mod gpio {
                 };
             }
         }
+
+        #[doc = r"Sets the pin function"]
+        #[inline(always)]
+        pub fn fsel(&mut self, pin: usize, mode: u8 ) {
+            let gpio = self.get();
+
+            let bank = pin / 10 as usize;
+            let mut val =  gpio.gpfsel[bank].get() ;
+            let shift = (pin - (10 * bank) ) * 3;
+            let mask = !((0x07 << shift) as u32);
+            val = (val & mask) | ((mode as u32) << shift);
+            gpio.gpfsel[bank].set(val);
+        }
+
+        #[doc = r"Sets an output pin to HIGH"]
+        #[inline(always)]
+        pub fn pin_high( &mut self, pin: usize ) {
+            let gpio = self.get();
+
+            let bank = pin / 32 as usize;
+            let shift = pin - (32 * bank) ;
+            let val = 1 << shift;
+            gpio.gpset[bank].set(val);
+        }
+        #[doc = r"Sets an output pin to LOW"]
+        #[inline(always)]
+        pub fn pin_low(&mut self, pin: usize) {
+            let gpio = self.get();
+
+            let bank = pin / 32 as usize;
+            let shift = pin - (32 * bank) ;
+            let val = 1 << shift;
+            gpio.gpclr[bank].set(val);
+        }
+
     }
     impl Drop for GPIOInterface {
+        #[doc = r"Unmaps the GPIO peripheral block memory with munmap(...)"]
         fn drop(&mut self) {
             unsafe {
                 libc::munmap( self.address as *mut libc::c_void, MAP_BLOCK_SIZE as libc::size_t );
@@ -605,6 +651,7 @@ pub mod gpio {
     }
 
 
+    #[doc = r"GPIO peripheral structure, allows direct memory access to peripheral registers"]
     #[repr(C)]
     pub struct GPIO {
         gpfsel: [VolatileCell<u32>; 6],
@@ -616,58 +663,12 @@ pub mod gpio {
     }
 
     impl GPIO {
-        #[inline(always)]
-        pub fn fsel(&mut self, pin: usize, mode: u8 ) {
-            let bank = pin / 10 as usize;
-            let mut val =  self.gpfsel[bank].get() ;
-            let shift = (pin - (10 * bank) ) * 3;
-            let mask = !((0x07 << shift) as u32);
-            val = (val & mask) | ((mode as u32) << shift);
-            self.gpfsel[bank].set(val);
-        }
-        #[inline(always)]
-        pub fn pin_high( &mut self, pin: usize ) {
-            let bank = pin / 32 as usize;
-            let shift = pin - (32 * bank) ;
-            let val = 1 << shift;
-            self.gpset[bank].set(val);
-        }
-        #[inline(always)]
-        pub fn pin_low(&mut self, pin: usize) {
-            let bank = pin / 32 as usize;
-            let shift = pin - (32 * bank) ;
-            let val = 1 << shift;
-            self.gpclr[bank].set(val);
-        }
+
 
     }
-
-
 }
 
 
-
-//pub struct SPI {
-//    fd: i32,
-//    gpio_mem: *mut u8,
-//    spi_mem: *mut u8,
-//    spi: Peripheral<spi::SPIPeripheral>,
-//}
-//
-//impl Drop for SPI {
-//    fn drop(&mut self) {
-//    }
-//}
-//
-//impl SPI {
-//    pub fn get() -> Option<Self> {
-//        None
-//    }
-//}
-//
-
-
-    
 
 #[cfg(test)]
 mod tests {
@@ -697,50 +698,28 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "disabled")]    // Uncomment to verify borrow rules for mmap(...) memory reference of GPIO structure
-    fn test_gpio_shouldnt_compile() {
-        let mut the_gpio: &mut gpio::GPIO;
-        {
-            let mut mem = DirectMemory::get().unwrap();
-            let mut gpio_iface = mem.gpio().unwrap();
-            the_gpio = gpio_iface.get();
-        }
-        the_gpio.fsel( 26, gpio::FSEL_OUTPUT );
-    }
-
-    #[test]
     fn test_gpio_fsel_out() {
-        let mut gpio_iface;
-        {
-            let mut mem = DirectMemory::get().unwrap();
-            gpio_iface = mem.gpio().unwrap();
-        }
-        {
-            let mut the_gpio: &mut gpio::GPIO;
-            the_gpio = gpio_iface.get();
-            the_gpio.fsel( 26, gpio::FSEL_OUTPUT );
-        }
+        let mut mem = DirectMemory::get().unwrap();
+        let mut gpio_iface = mem.gpio().unwrap();
+        gpio_iface.fsel( 26, gpio::FSEL_OUTPUT );
     }
     #[test]
     fn test_gpio_fsel_in() {
         let mut mem = DirectMemory::get().unwrap();
         let mut gpio_iface = mem.gpio().unwrap();
-        let mut the_gpio = gpio_iface.get();
-        the_gpio.fsel( 26, gpio::FSEL_INPUT );
+        gpio_iface.fsel( 26, gpio::FSEL_INPUT );
     }
     #[test]
     fn test_gpio_set_low() {
         let mut mem = DirectMemory::get().unwrap();
         let mut gpio_iface = mem.gpio().unwrap();
-        let mut the_gpio = gpio_iface.get();
-        the_gpio.pin_low( 26 );
+        gpio_iface.pin_low( 26 );
     }
     #[test]
     fn test_gpio_set_high() {
         let mut mem = DirectMemory::get().unwrap();
         let mut gpio_iface = mem.gpio().unwrap();
-        let mut the_gpio = gpio_iface.get();
-        the_gpio.pin_high( 26 );
+        gpio_iface.pin_high( 26 );
     }
 
     #[test]
