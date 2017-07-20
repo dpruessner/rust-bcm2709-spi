@@ -5,6 +5,8 @@ authors = ["Daniel Pruessner <daniel.pruessner@ieee.org>"]
 description = "Bare-metal (through mmap(...)) access of BCM2709 SPI peripheral in Rust for Linux host"
 repository = "https://github.com/dpruessner/rust-bcm2709-spi"
 keywords = [ "spi", "raspberry", "pi", "bcm2709" ]
+license = "MIT"
+license-file = "LICENSE"
 
 [dependencies]
 libc = "0.2.0"
